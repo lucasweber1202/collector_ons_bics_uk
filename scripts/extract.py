@@ -245,9 +245,23 @@ def parse_xlsx(
             )
     if release is None:
         raise ValueError("BICS release date missing")
-    for sheet_name, responses in SHEETS.items():
-        if sheet_name not in book.sheetnames:
-            raise ValueError(f"BICS question sheet missing: {sheet_name}")
+    # BICS is a rotating-module survey: an individual wave workbook carries only
+    # the question sheets asked in that wave, and each sheet it does carry holds
+    # that question's full time series. A configured sheet being absent from one
+    # wave is therefore normal and must not fail the run -- the next wave that
+    # asks the question restores its history in full. Structural drift is still
+    # caught below: if the workbook carries none of the configured questions, the
+    # layout itself has changed and the run fails loudly.
+    present = [name for name in SHEETS if name in book.sheetnames]
+    if not present:
+        raise ValueError(
+            "BICS workbook carries none of the configured question sheets "
+            f"({sorted(SHEETS)}); the source layout has changed"
+        )
+    for sheet_name in sorted(set(SHEETS) - set(present)):
+        logger.info("BICS question %r not asked in this wave; skipping", sheet_name)
+    for sheet_name in present:
+        responses = SHEETS[sheet_name]
         sheet = book[sheet_name]
         header = [str(sheet.cell(6, c).value or "").strip() for c in range(1, sheet.max_column + 1)]
         columns = {name: header.index(name) + 1 for name in responses if name in header}
@@ -281,6 +295,16 @@ def parse_xlsx(
                     "source_url": url,
                     "last_publish_date": release.date(),
                 }
+    # Scale the volume floor by the number of question sheets this wave actually
+    # carries. A rotating module means a legitimate wave can hold a single
+    # question, so a fixed fleet-wide floor would reject good data; a per-sheet
+    # floor still catches a truncated or mis-parsed sheet. Observed yields are
+    # ~400-470 observations and ~35-50 series per question sheet.
+    if len(observations) < 300 * len(present) or len(catalog) < 25 * len(present):
+        raise ValueError(
+            f"BICS selected history unexpectedly short: {len(observations)} observations "
+            f"and {len(catalog)} series across {len(present)} question sheet(s)"
+        )
     latest = max(o.reference_date for o in observations)
     for o in observations:
         current = o.reference_date == latest
@@ -289,8 +313,6 @@ def parse_xlsx(
             "official_timestamp" if current else "first_seen",
             release.date() if current else None,
         )
-    if len(observations) < 500 or len(catalog) < 50:
-        raise ValueError("BICS selected history unexpectedly short")
     return observations, catalog, release, availability
 
 
