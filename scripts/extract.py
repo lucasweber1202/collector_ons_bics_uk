@@ -227,7 +227,7 @@ def parse_xlsx(
     datetime,
     dict[tuple[str, date], tuple[datetime, str, date | None]],
 ]:
-    book = openpyxl.load_workbook(io.BytesIO(body), data_only=True, read_only=False)
+    book = openpyxl.load_workbook(io.BytesIO(body), data_only=True, read_only=True)
     observations = []
     catalog = {}
     availability = {}
@@ -263,20 +263,24 @@ def parse_xlsx(
     for sheet_name in present:
         responses = SHEETS[sheet_name]
         sheet = book[sheet_name]
-        header = [str(sheet.cell(6, c).value or "").strip() for c in range(1, sheet.max_column + 1)]
-        columns = {name: header.index(name) + 1 for name in responses if name in header}
+        rows = sheet.iter_rows(values_only=True)
+        first = next(rows, ())
+        question = str(first[0] if first else "").removeprefix("Question: ")
+        for _ in range(4):
+            next(rows, ())
+        header = [str(value or "").strip() for value in next(rows, ())]
+        columns = {name: header.index(name) for name in responses if name in header}
         if set(columns) != responses:
             raise ValueError(f"BICS response categories drifted in {sheet_name}")
-        question = str(sheet.cell(1, 1).value or "").removeprefix("Question: ")
-        for row in range(7, sheet.max_row + 1):
-            period = sheet.cell(row, 1).value
-            wave = str(sheet.cell(row, 2).value or "")
-            dimension = str(sheet.cell(row, 3).value or "").strip()
+        for row in rows:
+            period = row[0] if len(row) > 0 else None
+            wave = str(row[1] if len(row) > 1 else "")
+            dimension = str(row[2] if len(row) > 2 else "").strip()
             if not isinstance(period, str) or not wave.startswith("Wave ") or not dimension:
                 continue
             reference = _end_date(period)
             for response, col in columns.items():
-                raw = sheet.cell(row, col).value
+                raw = row[col] if len(row) > col else None
                 if not isinstance(raw, (int, float)):
                     continue
                 series_id = f"ONS_BICS_{_slug(sheet_name.replace(' TS (WTD)', ''))}_{_slug(response)}_{_slug(dimension)}"
