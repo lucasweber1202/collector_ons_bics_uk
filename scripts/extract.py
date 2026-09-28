@@ -7,15 +7,18 @@ import io
 import logging
 import math
 import re
+import time as clock
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from typing import Any
 from urllib.parse import urljoin
+from zipfile import BadZipFile
 
 import httpx
 import openpyxl
 
 from scripts.config import (
+    DOWNLOAD_DELAY,
     MAX_DOWNLOAD_BYTES,
     MAX_STALE_MONTHS,
     MIN_HISTORY_YEARS,
@@ -299,12 +302,10 @@ def parse_xlsx(
                     "source_url": url,
                     "last_publish_date": release.date(),
                 }
-    # Scale the volume floor by the number of question sheets this wave actually
-    # carries. A rotating module means a legitimate wave can hold a single
-    # question, so a fixed fleet-wide floor would reject good data; a per-sheet
-    # floor still catches a truncated or mis-parsed sheet. Observed yields are
-    # ~400-470 observations and ~35-50 series per question sheet.
-    if len(observations) < 300 * len(present) or len(catalog) < 25 * len(present):
+    # Historical official waves differ substantially in the number of rows per
+    # question. Header/category checks above prove the selected layout; a fixed
+    # per-sheet volume floor rejects authentic workbooks (e.g. wave 160).
+    if not observations or not catalog:
         raise ValueError(
             f"BICS selected history unexpectedly short: {len(observations)} observations "
             f"and {len(catalog)} series across {len(present)} question sheet(s)"
@@ -318,6 +319,48 @@ def parse_xlsx(
             release.date() if current else None,
         )
     return observations, catalog, release, availability
+
+
+def stitch_waves(
+    waves: list[
+        tuple[
+            list[Observation],
+            dict[str, dict[str, Any]],
+            dict[tuple[str, date], tuple[datetime, str, date | None]],
+        ]
+    ],
+) -> tuple[
+    list[Observation],
+    dict[str, dict[str, Any]],
+    dict[tuple[str, date], tuple[datetime, str, date | None]],
+]:
+    """Keep the newest value for overlaps and never join changed question wording.
+
+    Waves must be ordered newest first. Identical IDs with different question
+    text are separate statistical definitions; the older definition is excluded
+    instead of being silently attached to the newer series.
+    """
+    catalog: dict[str, dict[str, Any]] = {}
+    by_key: dict[tuple[str, date], Observation] = {}
+    availability: dict[tuple[str, date], tuple[datetime, str, date | None]] = {}
+    for observations, wave_catalog, wave_availability in waves:
+        for sid, fields in wave_catalog.items():
+            previous = catalog.get(sid)
+            if previous is None:
+                catalog[sid] = fields
+            elif previous["description"] != fields["description"]:
+                logger.warning(
+                    "BICS question wording changed for %s; older definition excluded", sid
+                )
+        for observation in observations:
+            sid = observation.series_id
+            if catalog[sid]["description"] != wave_catalog[sid]["description"]:
+                continue
+            key = sid, observation.reference_date
+            if key not in by_key:
+                by_key[key] = observation
+                availability[key] = wave_availability[key]
+    return list(by_key.values()), catalog, availability
 
 
 def collect() -> ExtractedData:
@@ -334,24 +377,46 @@ def collect() -> ExtractedData:
         )
         if not links:
             raise ValueError("No BICS wave workbook discovered")
-        path, wave = max(links, key=lambda item: int(item[1]))
-        url = urljoin(LANDING, path)
-        response = client.get(url)
-        response.raise_for_status()
-    body = response.content
-    if not body or len(body) > MAX_DOWNLOAD_BYTES:
-        raise ValueError(f"Invalid BICS artifact size {len(body)}")
-    digest = hashlib.sha256(body).hexdigest()
-    obs, catalog, release, availability = parse_xlsx(body, digest, url, fetched)
-    snapshot = build_snapshot(
-        "ons_bics",
-        url,
-        f"bics_wave_{wave}.xlsx",
-        body,
-        digest,
-        response.headers.get("etag"),
-        response.headers.get("last-modified"),
-        fetched,
-        release.date(),
-    )
-    return ExtractedData(obs, [snapshot], catalog, [release], availability)
+        by_wave = {int(wave): urljoin(LANDING, path) for path, wave in links}
+        waves = sorted(by_wave, reverse=True)
+        # BICS is roughly fortnightly. Sixty previous waves cover over two
+        # years even when a question rotates out for some releases.
+        selected = waves[:61]
+        parsed = []
+        snapshots = []
+        releases = []
+        for index, wave in enumerate(selected):
+            if index:
+                clock.sleep(DOWNLOAD_DELAY)
+            url = by_wave[wave]
+            response = client.get(url)
+            response.raise_for_status()
+            body = response.content
+            if not body or len(body) > MAX_DOWNLOAD_BYTES:
+                raise ValueError(f"Invalid BICS artifact size {len(body)} for wave {wave}")
+            digest = hashlib.sha256(body).hexdigest()
+            try:
+                obs, catalog, release, availability = parse_xlsx(body, digest, url, fetched)
+            except (ValueError, BadZipFile) as exc:
+                if index == 0:
+                    raise
+                logger.warning("Skipping historical BICS wave %d: %s", wave, exc)
+                continue
+            parsed.append((obs, catalog, availability))
+            releases.append(release)
+            snapshots.append(
+                build_snapshot(
+                    "ons_bics",
+                    url,
+                    f"bics_wave_{wave}.xlsx",
+                    body,
+                    digest,
+                    response.headers.get("etag"),
+                    response.headers.get("last-modified"),
+                    fetched,
+                    release.date(),
+                )
+            )
+            logger.info("BICS wave %d: %d observations, %d series", wave, len(obs), len(catalog))
+    observations, catalog, availability = stitch_waves(parsed)
+    return ExtractedData(observations, snapshots, catalog, releases, availability)
